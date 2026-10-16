@@ -1,0 +1,63 @@
+# Unity generated directories
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# IDE and editor files
+.vs/
+.vscode/
+.idea/
+*.csproj
+!Tools/LayoutVerify/LayoutVerify.csproj
+!Tools/GrassGenVerify/GrassGenVerify.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# Unity/Visual Studio generated metadata
+*.csproj.user
+*.unityproj
+*.tmp
+*.log
+*.bak
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Unity crash reports and profiler captures
+sysinfo.txt
+*.stacktrace
+*.snap
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Addressables generated data
+/ServerData/
+/Assets/StreamingAssets/aa.meta
+/Assets/StreamingAssets/aa/
+
+# Do not ignore Unity .meta files: they preserve GUID references.
+
+# Tools build outputs & downloaded source assets
+Tools/**/bin/
+Tools/**/obj/
+Tools/kenney_nature/
+Tools/terrain_tiles/
+

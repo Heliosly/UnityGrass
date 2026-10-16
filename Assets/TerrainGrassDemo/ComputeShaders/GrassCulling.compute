@@ -1,0 +1,91 @@
+// 草地 GPU 裁剪 ComputeShader。
+// 每个草 Chunk 每帧 Dispatch 一次: 64 线程一组, 每个线程处理一根草实例,
+// 通过裁剪的实例【直接 Append 完整实例数据】(不是索引!) 进 _VisibleLOD0 / _VisibleLOD1,
+// C# 侧再用 GraphicsBuffer.CopyCount 把 Append 缓冲的元素个数拷进
+// IndirectArguments 缓冲的 InstanceCount 槽, 驱动 RenderMeshIndirect。
+//
+// 为什么 Append 数据而不是索引(踩坑记录):
+//   第一版 Append 实例索引, Shader 用 ConfigureProcedural 把 unity_InstanceID 重映射为
+//   原始索引 —— 间接寻址在部分平台变体下不稳定, 曾出现"所有实例读到同一份数据、
+//   几千根草叠在同一个点"的现象(用户看到"每区块固定位置一棵草")。
+//   Append 完整数据后, Shader 用 SV_InstanceID 直接索引可见缓冲, 零间接层, 必然正确。
+#pragma kernel CSMain
+
+// 与 C# 端 GrassInstanceData 逐字段一致(32 字节)。
+// float3 对齐 16 字节: position[0..12) yaw[12..16) height[16..20) width[20..24)
+// type01[24..28) seed01[28..32) —— C# LayoutKind.Sequential 布局恰好相同。
+struct GrassInstance
+{
+    float3 position;
+    float yaw;
+    float height;
+    float width;
+    float type01;
+    float seed01;
+};
+
+StructuredBuffer<GrassInstance> _Instances;
+AppendStructuredBuffer<GrassInstance> _VisibleLOD0;
+AppendStructuredBuffer<GrassInstance> _VisibleLOD1;
+
+float4 _CameraPos;      // xyz = 相机世界坐标
+float4x4 _VPMatrix;     // 视图投影矩阵(投影 * 世界到相机)
+float4 _CullingParams;  // x = LOD0 最大距离, y = LOD1 最大距离(超出剔除), z = 淡出范围, w = 启用 LOD(0/1)
+float _FullDensityDistance; // 近密远疏: 此距离内 100% 密度
+uint _InstanceCount;
+
+// 视锥内测试: 齐次裁剪空间里点在 [-w, w] 立方体内即视为可见。
+// 边界放大 5%(×1.05): 草根在视锥边缘时, 三点测试结果会逐帧翻转 → 草闪烁,
+// 放大后边缘的草稳定可见, 由渲染管线自身做最终裁剪。
+bool InsideClip(float4 clip)
+{
+    float m = clip.w * 1.05;
+    return clip.x >= -m && clip.x <= m
+        && clip.y >= -m && clip.y <= m
+        && clip.z >= 0.0 && clip.z <= m;
+}
+
+// 确定性整数哈希(抖动用), 每个实例的哈希不随帧变化 → 淡出图案稳定
+uint Hash(uint x)
+{
+    x = x * 747796405u + 2891336453u;
+    x = ((x >> ((x >> 28) + 4)) ^ x) * 277803737u;
+    x = (x >> 22) ^ x;
+    return x;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x;
+    if (index >= _InstanceCount) return;
+
+    GrassInstance g = _Instances[index];
+
+    // ---------- 1. 距离剔除 + 近密远疏(3A 草地密度方案) ----------
+    // 每棵草有自己的最大显示距离: maxDist = lerp(全密度距离, LOD1距离, seed01)。
+    // 全密度距离内 100% 可见(草原不露地面); 之外平滑稀疏。
+    // Shader 侧用同样的公式算淡出带(边缘 12m alpha 渐变, 相机移动不闪烁)。
+    float dist = distance(_CameraPos.xyz, g.position);
+    float maxDist = lerp(_FullDensityDistance, _CullingParams.y, g.seed01);
+    if (dist > maxDist) return;
+
+    // ---------- 2. 视锥剔除 ----------
+    // 草是一根竖线, 只用草根一个点会误剔除"根在屏幕外、尖在屏幕内"的草,
+    // 所以保守地取 根/中/尖 三点, 任一点在视锥内即保留。
+    float4 c0 = mul(_VPMatrix, float4(g.position, 1.0));
+    float4 c1 = mul(_VPMatrix, float4(g.position + float3(0.0, g.height * 0.5, 0.0), 1.0));
+    float4 c2 = mul(_VPMatrix, float4(g.position + float3(0.0, g.height, 0.0), 1.0));
+    if (!InsideClip(c0) && !InsideClip(c1) && !InsideClip(c2)) return;
+
+    // ---------- 3. (已移除距离抖动淡出) ----------
+    // 踩坑: 原实现按实例哈希在淡出区随机剔除, 相机移动时草不断"出现/消失",
+    // 表现为草地在远处持续闪烁。渐隐改由片元 alpha(fade) 完成 —— 平滑且无帧间闪烁。
+
+    // ---------- 4. LOD 分类 ----------
+    // LOD 关闭(w < 0.5)时全部进 LOD0 —— 这是"GPU Culling 开、LOD 关"的对照状态。
+    if (_CullingParams.w < 0.5 || dist <= _CullingParams.x)
+        _VisibleLOD0.Append(g);   // 直接 Append 完整实例数据(见文件头注释)
+    else
+        _VisibleLOD1.Append(g);
+}

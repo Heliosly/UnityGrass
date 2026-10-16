@@ -1,0 +1,92 @@
+// 草地交互 ComputeShader —— 维护一张低分辨率交互纹理(需求 5)。
+//
+// 纹理通道约定(与 GrassIndirect.shader 的采样代码对应):
+//   R/G = 倒伏方向(0.5 居中编码: 0.5±0.5*方向分量)
+//   B   = 倒伏强度(0..1)
+//
+// 每帧做的事:
+//   1. 对上一帧结果做指数衰减(_Decay = exp(-rate*dt));
+//   2. 以"当前世界中心"重映射采样坐标(玩家移动时纹理跟着世界走, 需求 5.8);
+//   3. 把每个交互体画成圆形笔刷(移动方向 = 倒伏方向)。
+//
+// 为什么用 ComputeShader 而不是多个 Blit:
+//   衰减 + 坐标重映射 + 多笔刷可以在一趟 Dispatch 里做完, 不需要额外的 Blit 材质和多次全屏 Pass;
+//   RT 开 enableRandomWrite 后可直接当 UAV 写。
+#pragma kernel CSMain
+
+RWTexture2D<float4> _InteractionWrite;
+Texture2D<float4> _InteractionRead;
+SamplerState sampler_InteractionRead; // linear + clamp
+
+float4 _CenterOld;      // xy = 旧世界中心, z = extent(覆盖边长)
+float4 _CenterNew;      // xy = 新世界中心
+float _Decay;
+uint _Res;
+int _InteractorCount;
+float4 _InteractorPos[4];    // xyz = 世界坐标
+float4 _InteractorDir[4];    // xy = 移动方向(xz 平面), w = 速度
+float4 _InteractorParams[4]; // x = 半径, y = 强度
+
+// 世界坐标 → 纹理 UV。必须与 GrassIndirect.shader 的 InteractionUV 逐字一致,
+// 否则草的采样位置和笔刷绘制位置会对不上。
+// 约定: uv 0..1 覆盖世界 [center - extent, center + extent], uv=0.5 恰好在中心。
+float2 WorldToUV(float2 world, float2 center, float extent)
+{
+    return (world - center) / extent * 0.5 + 0.5;
+}
+
+float2 UVToWorld(float2 uv, float2 center, float extent)
+{
+    return (uv - 0.5) * extent * 2.0 + center;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _Res || id.y >= _Res) return;
+
+    // 本像素的世界坐标(以"新"中心为参考系)
+    float2 uv = (float2(id.xy) + 0.5) / _Res;
+    float2 world = UVToWorld(uv, _CenterNew.xy, _CenterNew.z);
+
+    // ---------- 1. 衰减 ----------
+    // 只衰减强度(B); 方向(RG)保持最后有效方向 —— 踩坑: 原 v *= _Decay 让
+    // RG 中性值 (0.5,0.5) 一起衰减 → 解码后方向趋向 (-1,-1) 而不是"无方向",
+    // 草恢复时朝固定斜向漂移(交互生硬的原因之一)。
+    float2 oldUV = WorldToUV(world, _CenterOld.xy, _CenterOld.z);
+    float4 v = _InteractionRead.SampleLevel(sampler_InteractionRead, oldUV, 0);
+    v.b *= _Decay;
+    if (v.b < 0.01f) v.rg = 0.5; // 强度耗尽 → 方向复位中性
+
+    // ---------- 2. 笔刷 ----------
+    for (int i = 0; i < _InteractorCount; i++)
+    {
+        // 静止不压草(整改第3步): 速度低于 0.1 m/s 跳过 —— 原实现 normalize(0.0001,0)
+        // 得到固定 +X 方向, 玩家站着不动草也被持续压向一个方向。
+        if (_InteractorDir[i].w < 0.1) continue;
+
+        float2 d = world - _InteractorPos[i].xz;
+        float dist = length(d);
+        float fall = saturate(1.0 - dist / _InteractorParams[i].x);
+        if (fall <= 0.0) continue;
+        fall = fall * fall * (3.0 - 2.0 * fall); // smoothstep: 圆形边缘柔和衰减
+
+        float strength = _InteractorParams[i].y * fall;
+        float2 dir2d = normalize(_InteractorDir[i].xy + float2(0.0001, 0.0));
+        float2 dir01 = dir2d * 0.5 + 0.5;
+
+        // 方向混合: 新笔刷越强, 方向越接近笔刷方向;
+        // 旧强度仍占主导时保留旧方向(玩家刚离开后草继续朝原方向倒, 而不是立刻转向)。
+        float oldS = v.b;
+        float blend = strength / max(oldS + strength, 0.0001);
+        v.rg = lerp(v.rg, dir01, blend);
+
+        // 强度渐进压入(参考 QnMobile 的 TouchBegin/TouchFactor 渐变):
+        // 不用 max 硬写 —— 硬写让草"瞬移倒伏", 生硬;
+        // 向目标值每帧靠近 18%(原 35%): 草是被"慢慢压弯"的, 手感更柔和。
+        float target = max(v.b, strength);
+        v.b = lerp(v.b, target, 0.18);
+    }
+
+    _InteractionWrite[id.xy] = v;
+}
